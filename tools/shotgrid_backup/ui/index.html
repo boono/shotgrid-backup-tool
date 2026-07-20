@@ -34,11 +34,12 @@
         </div>
         <div class="scope-block">
           <strong>固定为完整备份</strong>
-          <p>自动备份当前 Script 可读的全部实体、归档项目、active/retired 记录、Attachment 原文件和 API 可下载媒体。并发数由本机自动确定。</p>
+          <p>自动备份当前 Script 可读的全部实体、归档项目、active/retired 记录、Attachment 原文件和 ShotGrid 托管媒体。媒体补充包按来源分层存储，不会把文件平铺到同一目录；并发数会根据实时吞吐自动调整。</p>
+          <label class="check-row"><input id="copyExternal" type="checkbox">同时复制 PublishedFile / 本地 / NAS 媒体（可选）</label>
         </div>
         <div class="actions">
           <button id="checkButton" class="secondary">运行完整检查</button>
-          <button id="startButton" class="primary" disabled>开始备份</button>
+          <button id="startButton" class="primary" disabled>开始完整备份</button>
         </div>
         <div id="checkResults" class="check-results empty">等待检查</div>
       </section>
@@ -51,8 +52,15 @@
           <article><small>实体</small><strong id="entityValue">0 / 0</strong></article>
           <article><small>记录</small><strong id="recordValue">0 / 0</strong></article>
           <article><small>本地文件</small><strong id="attachmentValue">0 / 0</strong></article>
+          <article><small>媒体补充项</small><strong id="transferItemValue">0 / 0</strong></article>
+          <article><small>复用 / 跳过</small><strong id="reusedValue">0</strong></article>
+          <article><small>重试状态</small><strong id="retryValue" class="compact">重试 0 · 成功 0 · 失败 0 · 等待</strong></article>
+          <article><small>传输数据</small><strong id="transferBytesValue">0 B / 0 B</strong></article>
+          <article><small>下载带宽</small><strong id="downloadBandwidthValue">0 B/s</strong></article>
+          <article><small>复制带宽</small><strong id="copyBandwidthValue">0 B/s</strong></article>
+          <article><small>自适应并发</small><strong id="workerValue" class="compact">D:0 / C:0</strong></article>
           <article><small>已用时间</small><strong id="elapsedValue">00:00</strong></article>
-          <article><small>预计剩余</small><strong id="etaValue">--:--</strong></article>
+          <article><small>预计剩余</small><strong id="etaValue" class="compact">--:--</strong></article>
         </div>
         <div class="result-row"><span id="resultMessage">尚未开始备份</span><button id="openOutput" class="ghost" disabled>在 Finder 中打开</button></div>
       </section>

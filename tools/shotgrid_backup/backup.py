@@ -11,6 +11,8 @@ import json
 import os
 import platform
 import re
+import secrets
+import socket
 import sys
 import tempfile
 import threading
@@ -31,7 +33,22 @@ SENSITIVE_TEXT = re.compile(
     r"(?i)(authorization|api[_-]?key|script[_-]?key|client_secret|access_token|"
     r"refresh_token|cookie|password|token)(\s*[:=]\s*)([^\s&,;]+)"
 )
-URL_CREDENTIALS = re.compile(r"(?i)(https?://)([^/@\s]+)@")
+# Error strings sometimes contain unescaped spaces in file/NAS URLs. Match to a
+# hard punctuation boundary so the remainder of such paths cannot leak.
+URL_TEXT = re.compile(
+    r"(?i)\b(?:https?|file|smb|afp|nfs)://[^,;，；\r\n<>\"']+"
+)
+BARE_PROXY_CREDENTIALS = re.compile(
+    r"(?i)(?<![A-Za-z0-9._-])[^:@/\s]+:[^@/\s]+@"
+    r"(?=(?:\[[0-9A-F:]+\]|[A-Za-z0-9.-]+)(?::\d{1,5})?(?:\s|$|[,;]))"
+)
+QUOTED_TEXT = re.compile(r"(?P<quote>['\"])(?P<content>.*?)(?P=quote)")
+WINDOWS_ABSOLUTE_PATH = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])(?:[A-Z]:[\\/]|\\\\)[^,;，；\r\n<>\"']+"
+)
+POSIX_ABSOLUTE_PATH = re.compile(
+    r"(?<![A-Za-z0-9_:])/(?:[^,;，；\r\n<>\"']+)"
+)
 
 
 def json_value(value: Any) -> Any:
@@ -46,6 +63,57 @@ def json_value(value: Any) -> Any:
     return value
 
 
+def _safe_url(value: str) -> str:
+    """Keep only a URL origin; never persist credentials or signed path material."""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        scheme = value.split(":", 1)[0].lower()
+        return f"{scheme}://[URL_REDACTED]"
+    if parsed.scheme.lower() == "file":
+        return "file://[PATH_REDACTED]"
+    try:
+        host = parsed.hostname or "[HOST_REDACTED]"
+    except ValueError:
+        host = "[HOST_REDACTED]"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    try:
+        port = f":{parsed.port}" if parsed.port else ""
+    except ValueError:
+        port = ""
+    return f"{parsed.scheme.lower()}://{host}{port}/[URL_REDACTED]"
+
+
+def _redact_urls_and_paths(value: str) -> str:
+    """Remove URL secrets and local, Windows or NAS absolute path details."""
+    safe_urls: list[str] = []
+
+    def replace_url(match: re.Match[str]) -> str:
+        marker = f"SAFEURLTOKEN{len(safe_urls)}ENDTOKEN"
+        safe_urls.append(_safe_url(match.group(0)))
+        return marker
+
+    value = URL_TEXT.sub(replace_url, value)
+    value = BARE_PROXY_CREDENTIALS.sub("[CREDENTIALS_REDACTED]@", value)
+
+    def replace_quoted(match: re.Match[str]) -> str:
+        content = match.group("content")
+        if (
+            content.startswith(("/", "\\\\"))
+            or re.match(r"(?i)^[A-Z]:[\\/]", content)
+        ):
+            return f"{match.group('quote')}[PATH_REDACTED]{match.group('quote')}"
+        return match.group(0)
+
+    value = QUOTED_TEXT.sub(replace_quoted, value)
+    value = WINDOWS_ABSOLUTE_PATH.sub("[PATH_REDACTED]", value)
+    value = POSIX_ABSOLUTE_PATH.sub("[PATH_REDACTED]", value)
+    for index, safe_url in enumerate(safe_urls):
+        value = value.replace(f"SAFEURLTOKEN{index}ENDTOKEN", safe_url)
+    return value
+
+
 def safe_error(error: BaseException, secret_values: Iterable[str] = ()) -> dict[str, str]:
     """Return a bounded error safe for UI, manifests and persistent logs."""
     message = str(error).replace("\r", " ").replace("\n", " ")
@@ -53,7 +121,7 @@ def safe_error(error: BaseException, secret_values: Iterable[str] = ()) -> dict[
         if secret:
             message = message.replace(secret, "[REDACTED]")
     message = SENSITIVE_TEXT.sub(r"\1\2[REDACTED]", message)
-    message = URL_CREDENTIALS.sub(r"\1[REDACTED]@", message)
+    message = _redact_urls_and_paths(message)
     return {"type": type(error).__name__, "message": message[:600] or "未提供错误详情"}
 
 
@@ -92,11 +160,112 @@ def fsync_directory(path: Path) -> None:
 
 
 def ensure_private_directory(path: Path) -> None:
+    existed = path.exists()
     path.mkdir(mode=0o700, parents=True, exist_ok=True)
     if os.name != "nt":
         if path.is_symlink():
             raise RuntimeError(f"拒绝使用符号链接目录：{path}")
-        os.chmod(path, 0o700)
+        if not existed:
+            os.chmod(path, 0o700)
+
+
+def shotgrid_site_origin(sg: Any) -> str:
+    """Return a canonical origin from real or test shotgun_api3 clients."""
+    value = getattr(sg, "base_url", None)
+    config = getattr(sg, "config", None)
+    if not value and config is not None:
+        server = getattr(config, "server", None)
+        if server:
+            raw_server = str(server).strip()
+            if "://" in raw_server:
+                value = raw_server
+            else:
+                scheme = str(getattr(config, "scheme", None) or "https").rstrip(":/")
+                value = f"{scheme}://{raw_server}"
+    if not value:
+        value = os.environ.get("SHOTGRID_URL", "")
+    text = str(value or "").strip().rstrip("/")
+    if text and "://" not in text:
+        text = "https://" + text
+    return text
+
+
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def retire_stale_output_lock(lock_path: Path, minimum_age_seconds: float = 15.0) -> None:
+    """Retire only a same-host dead lock; young or foreign locks fail closed."""
+    try:
+        before = lock_path.lstat()
+    except FileNotFoundError:
+        return
+    if lock_path.is_symlink() or not lock_path.is_file():
+        raise RuntimeError("输出目录锁不是安全的普通文件")
+    age = max(0.0, time.time() - before.st_mtime)
+    try:
+        text = lock_path.read_text(encoding="utf-8")[:4096]
+        metadata = json.loads(text) if text.lstrip().startswith("{") else {}
+        if not metadata:
+            match = re.search(r"\bpid=(\d+)\b", text)
+            metadata = {"pid": int(match.group(1)) if match else 0}
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        metadata = {}
+    lock_host = str(metadata.get("host") or "")
+    if lock_host and lock_host != socket.gethostname():
+        raise RuntimeError("输出目录锁来自另一台主机，拒绝自动接管")
+    pid = int(metadata.get("pid") or 0)
+    if _pid_is_alive(pid):
+        raise RuntimeError("输出目录已有仍在运行的备份/媒体任务")
+    if age < minimum_age_seconds:
+        raise RuntimeError("输出目录锁刚创建且所有权尚未确认，请稍后重试")
+    after = lock_path.lstat()
+    if (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+        raise RuntimeError("输出目录锁在检查期间发生变化")
+    stale = lock_path.with_name(
+        f"{lock_path.name}.stale.{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%dT%H%M%SZ')}"
+    )
+    os.replace(lock_path, stale)
+
+
+def acquire_output_lock(lock_path: Path) -> tuple[int, tuple[int, int]]:
+    retire_stale_output_lock(lock_path)
+    try:
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError as error:
+        raise RuntimeError("输出目录已有备份或媒体补全任务") from error
+    metadata = {
+        "version": 1,
+        "host": socket.gethostname(),
+        "pid": os.getpid(),
+        "token": secrets.token_hex(16),
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    os.write(descriptor, (json.dumps(metadata, sort_keys=True) + "\n").encode("utf-8"))
+    os.fsync(descriptor)
+    current = os.fstat(descriptor)
+    return descriptor, (current.st_dev, current.st_ino)
+
+
+def release_output_lock(lock_path: Path, descriptor: int, identity: tuple[int, int]) -> None:
+    try:
+        os.close(descriptor)
+    finally:
+        try:
+            current = lock_path.lstat()
+        except FileNotFoundError:
+            return
+        if (current.st_dev, current.st_ino) == identity and not lock_path.is_symlink():
+            lock_path.unlink()
+            fsync_directory(lock_path.parent)
 
 
 def retry(call: Callable[[], Any], attempts: int, label: str) -> Any:
@@ -225,7 +394,7 @@ def safe_attachment_name(record: dict[str, Any]) -> str:
     original = uploaded.get("name") or uploaded.get("url") or f"attachment_{record['id']}"
     original = Path(str(original).split("?")[0]).name
     cleaned = SAFE_NAME.sub("_", original).strip("._") or "attachment"
-    return f"{record['id']}_{cleaned}"[:180]
+    return cleaned[:180]
 
 
 def safe_media_name(item: dict[str, Any]) -> str:
@@ -234,8 +403,24 @@ def safe_media_name(item: dict[str, Any]) -> str:
     original = value.get("name") if isinstance(value, dict) else None
     original = original or Path(urlsplit(str(url)).path).name or item["field"]
     cleaned = SAFE_NAME.sub("_", str(original)).strip("._") or "media"
-    prefix = f"{item['source_id']}_{item['field']}_"
-    return (prefix + cleaned)[:180]
+    return cleaned[:180]
+
+
+def safe_path_component(value: Any, fallback: str) -> str:
+    cleaned = SAFE_NAME.sub("_", str(value)).strip("._")
+    return (cleaned or fallback)[:120]
+
+
+def id_bucket(source_id: int) -> str:
+    if source_id < 0:
+        raise ValueError("实体 ID 不能小于 0")
+    start = (source_id // 1000) * 1000
+    return f"{start:06d}_{start + 999:06d}"
+
+
+def is_structured_upload(value: Any) -> bool:
+    """Only ShotGrid upload dictionaries may enter authenticated download APIs."""
+    return isinstance(value, dict) and value.get("link_type") == "upload"
 
 
 def media_download_url(item: dict[str, Any]) -> str | None:
@@ -328,7 +513,12 @@ def _run_backup_unlocked(
     attempts = int(config.get("max_retries", 4))
     include_retired = bool(config.get("include_retired", True))
     retirement_support = config.get("retirement_support") or {}
-    download_attachments = bool(config.get("download_attachments", True)) and not args.no_attachments
+    defer_media = bool(config.get("defer_media", False))
+    download_attachments = (
+        bool(config.get("download_attachments", True))
+        and not args.no_attachments
+        and not defer_media
+    )
     workers = int(getattr(args, "workers", None) or config.get("workers", 4))
     if requested_page_size < 1 or attempts < 1 or workers < 1:
         raise ValueError("page_size、max_retries 和 workers 必须大于 0")
@@ -382,7 +572,7 @@ def _run_backup_unlocked(
     event_log_path.touch(mode=0o600)
     os.chmod(event_log_path, 0o600)
 
-    site_url = getattr(getattr(sg, "config", None), "server", None) or os.environ.get("SHOTGRID_URL", "")
+    site_url = shotgrid_site_origin(sg)
     site_fingerprint = hashlib.sha256(str(site_url).lower().encode("utf-8")).hexdigest()
     entity_schema = retry(sg.schema_entity_read, attempts, "读取实体 schema")
     all_readable = bool(config.get("all_readable", False))
@@ -420,25 +610,36 @@ def _run_backup_unlocked(
         "scope": "all_readable_entities" if all_readable else "explicit_entities",
         "completeness": {
             "profile": (
-                "site_full" if all_readable and not args.updated_since and download_attachments
+                "site_api_full" if defer_media and all_readable and not args.updated_since
+                else "site_full" if all_readable and not args.updated_since and download_attachments
                 else "scoped"
             ),
             "all_readable_entities": all_readable,
             "full_history": not bool(args.updated_since),
             "attachment_payloads": download_attachments,
-            "downloadable_media_payloads": True,
-            "external_published_files": "metadata_only",
+            "downloadable_media_payloads": not defer_media,
+            "external_published_files": (
+                "deferred_to_media_supplement" if defer_media else "metadata_only"
+            ),
         },
         "entity_types_planned": entities,
         "entities": {},
-        "attachments": {"downloaded": 0, "failed": 0, "skipped": 0, "total": 0},
+        "attachments": {
+            "downloaded": 0, "failed": 0, "skipped": 0, "total": 0, "deferred": 0,
+        },
         "media": {
-            "policy": "all_api_downloadable_image_filmstrip_and_upload_urls",
-            "external_published_files": "metadata_only",
+            "policy": (
+                "payloads_deferred_to_media_supplement" if defer_media
+                else "structured_shotgrid_uploads_only"
+            ),
+            "external_published_files": (
+                "deferred_to_media_supplement" if defer_media else "metadata_only"
+            ),
             "downloaded": 0,
             "failed": 0,
             "metadata_only": 0,
             "total": 0,
+            "deferred": 0,
         },
         "restore_contract": {
             "source_identity": "entity_type_and_source_id",
@@ -451,6 +652,32 @@ def _run_backup_unlocked(
             "verification_command": "python tools/shotgrid_backup/snapshot_verify.py <snapshot> --verify",
         },
         "errors": [],
+    }
+    if defer_media:
+        manifest["payload_scope"] = "deferred_to_media_supplement"
+    recovery_header = {
+        "format": "shotgrid_snapshot_recovery_header",
+        "schema_version": 1,
+        "snapshot_id": snapshot_id,
+        "created_at": started.isoformat(),
+        "source": dict(manifest["source"]),
+        "mode": manifest["mode"],
+        "updated_since": manifest["updated_since"],
+        "snapshot_upper_bound": manifest["snapshot_upper_bound"],
+        "include_archived_projects": manifest["include_archived_projects"],
+        "include_retired": manifest["include_retired"],
+        "consistency": manifest["consistency"],
+        "scope": manifest["scope"],
+        "all_readable_entities": all_readable,
+        "entity_types_planned": list(entities),
+        "defer_media": defer_media,
+        "payload_scope": manifest.get("payload_scope", "included_in_base"),
+    }
+    recovery_header_path = incomplete / "recovery_header.json"
+    atomic_json(recovery_header_path, recovery_header)
+    manifest["recovery_header"] = {
+        "file": recovery_header_path.name,
+        "sha256": sha256_file(recovery_header_path),
     }
     atomic_json(incomplete / "schema/entities.json", entity_schema)
     emit("snapshot_created", snapshot_id=snapshot_id, entities_total=len(entities), mode=manifest["mode"])
@@ -580,16 +807,13 @@ def _run_backup_unlocked(
                         value = record.get(field_name)
                         if not value:
                             continue
-                        link_type = value.get("link_type") if isinstance(value, dict) else None
-                        downloadable = data_type == "image" or field_name in {"image", "filmstrip_image"}
-                        downloadable = downloadable or link_type == "upload"
                         media_rows.append({
                             "entity": entity,
                             "source_id": int(record["id"]),
                             "field": field_name,
                             "state": "retired" if retired else "active",
                             "data_type": data_type,
-                            "downloadable": downloadable,
+                            "downloadable": is_structured_upload(value),
                             "value": value,
                         })
             stream.flush()
@@ -639,12 +863,18 @@ def _run_backup_unlocked(
                 emit("entity_error", entity=entity, phase="records", error=safe)
                 print(f"{entity}: 失败：{safe['type']}: {safe['message']}", file=sys.stderr)
 
+    if defer_media and "Attachment" in entities:
+        manifest["attachments"]["deferred"] = sum(
+            1 for record in attachment_rows
+            if is_structured_upload(record.get("this_file"))
+        )
+
     if download_attachments and "Attachment" in entities:
         attachment_dir = incomplete / "attachments"
         ensure_private_directory(attachment_dir)
         upload_rows = [
             record for record in attachment_rows
-            if (record.get("this_file") or {}).get("link_type") == "upload"
+            if is_structured_upload(record.get("this_file"))
         ]
         manifest["attachments"]["skipped"] = len(attachment_rows) - len(upload_rows)
         manifest["attachments"]["total"] = len(upload_rows)
@@ -657,7 +887,12 @@ def _run_backup_unlocked(
             return local_client.client
 
         def download_one(record: dict[str, Any]) -> dict[str, Any]:
-            target = attachment_dir / safe_attachment_name(record)
+            attachment_id = int(record["id"])
+            bucket_dir = attachment_dir / id_bucket(attachment_id)
+            ensure_private_directory(bucket_dir)
+            record_dir = bucket_dir / str(attachment_id)
+            ensure_private_directory(record_dir)
+            target = record_dir / safe_attachment_name(record)
             temporary = target.with_suffix(target.suffix + ".part")
             if temporary.exists() and temporary.is_symlink():
                 raise RuntimeError("拒绝覆盖符号链接 .part 文件")
@@ -680,9 +915,9 @@ def _run_backup_unlocked(
                 os.chmod(temporary, 0o600)
                 os.replace(temporary, target)
                 return {
-                    "attachment_id": record["id"],
+                    "attachment_id": attachment_id,
                     "retired": bool(record.get("_backup_retired")),
-                    "file": target.name,
+                    "file": target.relative_to(attachment_dir).as_posix(),
                     "size": target.stat().st_size,
                     "sha256": sha256_file(target),
                 }
@@ -708,11 +943,15 @@ def _run_backup_unlocked(
         attachment_index.sort(key=lambda item: item["attachment_id"])
         atomic_json(attachment_dir / "index.json", attachment_index)
 
-    downloadable_media = [
-        item for item in media_rows if item["downloadable"] and media_download_url(item)
+    downloadable_media = [] if defer_media else [
+        item for item in media_rows
+        if is_structured_upload(item.get("value")) and media_download_url(item)
     ]
-    manifest["media"]["metadata_only"] = len(media_rows) - len(downloadable_media)
-    manifest["media"]["total"] = len(downloadable_media)
+    if defer_media:
+        manifest["media"]["deferred"] = len(media_rows)
+    else:
+        manifest["media"]["metadata_only"] = len(media_rows) - len(downloadable_media)
+        manifest["media"]["total"] = len(downloadable_media)
     if downloadable_media:
         media_root = incomplete / "media"
         ensure_private_directory(media_root)
@@ -729,9 +968,16 @@ def _run_backup_unlocked(
             return media_local.client
 
         def download_media_item(item: dict[str, Any]) -> dict[str, Any]:
-            entity_dir = media_root / item["entity"]
+            entity_dir = media_root / safe_path_component(item["entity"], "Entity")
             ensure_private_directory(entity_dir)
-            target = entity_dir / safe_media_name(item)
+            source_id = int(item["source_id"])
+            bucket_dir = entity_dir / id_bucket(source_id)
+            ensure_private_directory(bucket_dir)
+            source_dir = bucket_dir / str(source_id)
+            ensure_private_directory(source_dir)
+            field_dir = source_dir / safe_path_component(item["field"], "field")
+            ensure_private_directory(field_dir)
+            target = field_dir / safe_media_name(item)
             temporary = target.with_suffix(target.suffix + ".part")
             if temporary.exists() and temporary.is_symlink():
                 raise RuntimeError("拒绝覆盖符号链接 .part 文件")
@@ -741,7 +987,9 @@ def _run_backup_unlocked(
                 url = media_download_url(item)
                 if not url:
                     raise RuntimeError("媒体没有可下载 URL")
-                attachment_value = item["value"] if isinstance(item["value"], dict) else {"url": url}
+                attachment_value = item.get("value")
+                if not is_structured_upload(attachment_value):
+                    raise RuntimeError("拒绝把非 ShotGrid upload 媒体交给认证下载客户端")
                 retry(
                     lambda: media_client().download_attachment(attachment_value, file_path=str(temporary)),
                     attempts,
@@ -809,7 +1057,7 @@ def _run_backup_unlocked(
     atomic_json(incomplete / "logs/errors.json", manifest["errors"])
     atomic_json(incomplete / "manifest.json", manifest)
     if manifest["errors"]:
-        emit("backup_error", errors=len(manifest["errors"]), path=str(incomplete))
+        emit("backup_error", errors=len(manifest["errors"]), snapshot_id=snapshot_id)
         raise RuntimeError(f"备份存在 {len(manifest['errors'])} 个错误；结果保留在 {incomplete}")
     emit("snapshot_sealed", snapshot_id=snapshot_id, errors=0)
     checksum_paths = [
@@ -859,20 +1107,11 @@ def run_backup(
     output_root = args.output.resolve()
     ensure_private_directory(output_root)
     lock_path = output_root / ".backup.lock"
+    descriptor, lock_identity = acquire_output_lock(lock_path)
     try:
-        descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
-    except FileExistsError as error:
-        raise RuntimeError(
-            f"输出目录已有备份锁：{lock_path}；确认没有任务运行后再移除该锁"
-        ) from error
-    try:
-        os.write(descriptor, f"pid={os.getpid()}\n".encode("utf-8"))
-        os.fsync(descriptor)
         return _run_backup_unlocked(sg, args, config, client_factory, progress)
     finally:
-        os.close(descriptor)
-        lock_path.unlink(missing_ok=True)
-        fsync_directory(output_root)
+        release_output_lock(lock_path, descriptor, lock_identity)
 
 
 def build_parser() -> argparse.ArgumentParser:

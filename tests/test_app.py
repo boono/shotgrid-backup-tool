@@ -26,8 +26,21 @@ class AppTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             settings = app.validate_settings(self.payload(temp))
         self.assertTrue(settings["download_attachments"])
+        self.assertFalse(settings["copy_external"])
         self.assertIsNone(settings["updated_since"])
         self.assertGreaterEqual(settings["workers"], 1)
+
+    def test_completion_message_respects_optional_external_copy(self):
+        state = app.JobState()
+        state.begin({}, "media_supplement", copy_external=False)
+        state.finish("/tmp/supplement")
+        self.assertEqual(state.status, "complete")
+        self.assertIn("ShotGrid 托管媒体已补全", state.message)
+        self.assertIn("外部文件未请求复制", state.message)
+
+        state.begin({}, "media_supplement", copy_external=True)
+        state.finish("/tmp/supplement")
+        self.assertIn("外部媒体已补全", state.message)
 
     def test_rejects_site_credentials_and_authenticated_proxy(self):
         with tempfile.TemporaryDirectory() as temp:

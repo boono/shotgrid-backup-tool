@@ -108,6 +108,29 @@ class BackupTests(unittest.TestCase):
                 client = backup.connect("127.0.0.1:7892")
         self.assertEqual(client.kwargs["http_proxy"], "127.0.0.1:7892")
 
+    def test_real_client_host_only_config_rebuilds_site_origin(self):
+        client = SimpleNamespace(
+            base_url="https://example.shotgrid.autodesk.com",
+            config=SimpleNamespace(
+                server="example.shotgrid.autodesk.com",
+                scheme="https",
+            ),
+        )
+        self.assertEqual(
+            backup.shotgrid_site_origin(client),
+            "https://example.shotgrid.autodesk.com",
+        )
+        del client.base_url
+        self.assertEqual(
+            backup.shotgrid_site_origin(client),
+            "https://example.shotgrid.autodesk.com",
+        )
+        client.config.server = "https://example.shotgrid.autodesk.com"
+        self.assertEqual(
+            backup.shotgrid_site_origin(client),
+            "https://example.shotgrid.autodesk.com",
+        )
+
     def test_backup_writes_complete_snapshot_and_latest(self):
         with tempfile.TemporaryDirectory() as temp:
             output = Path(temp) / "backups"
@@ -129,6 +152,15 @@ class BackupTests(unittest.TestCase):
             self.assertEqual(envelope["record"]["updated_at"], "2026-01-02T03:04:05")
             self.assertTrue((result / "COMPLETED.json").is_file())
             self.assertTrue((result / "checksums.sha256").is_file())
+            recovery_header = json.loads(
+                (result / "recovery_header.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(recovery_header["source"]["site"], manifest["source"]["site"])
+            self.assertEqual(
+                manifest["recovery_header"]["sha256"],
+                backup.sha256_file(result / "recovery_header.json"),
+            )
+            self.assertIn("recovery_header.json", (result / "checksums.sha256").read_text())
             self.assertEqual((output / "latest.txt").read_text().strip(), result.name)
 
     def test_backup_uses_keyset_and_valid_time_operator(self):
@@ -163,6 +195,24 @@ class BackupTests(unittest.TestCase):
             verification = snapshot_verify.verify_snapshot(result)
             self.assertFalse(verification["ok"])
             self.assertTrue(any("SHA-256" in error or "哈希" in error for error in verification["errors"]))
+
+    @unittest.skipIf(os.name == "nt", "Windows symlink 权限因运行环境而异")
+    def test_snapshot_verify_rejects_internal_symlink(self):
+        with tempfile.TemporaryDirectory() as temp:
+            args = Namespace(
+                entities="Shot", output=Path(temp), updated_since=None,
+                no_attachments=True, workers=1,
+            )
+            result = backup.run_backup(
+                FakeShotGrid(), args, {"page_size": 10, "max_retries": 1}
+            )
+            (result / "rogue_link").symlink_to(result / "manifest.json")
+            verification = snapshot_verify.verify_snapshot(result)
+            self.assertFalse(verification["ok"])
+            self.assertTrue(
+                any("符号链接" in error or "symlink" in error.lower() for error in verification["errors"]),
+                verification["errors"],
+            )
 
     def test_entity_and_multi_entity_links_are_indexed_in_order(self):
         class LinkShotGrid(FakeShotGrid):
@@ -225,7 +275,7 @@ class BackupTests(unittest.TestCase):
             self.assertTrue(verification["ok"], verification["errors"])
             self.assertEqual(verification["profile"], "site_full")
 
-    def test_media_download_uses_shotgrid_client_and_source_size(self):
+    def test_bare_media_url_is_deferred_from_authenticated_client(self):
         class MediaShotGrid(FakeShotGrid):
             def __init__(self):
                 super().__init__()
@@ -265,8 +315,9 @@ class BackupTests(unittest.TestCase):
                 client, args, {"all_readable": True, "page_size": 10, "max_retries": 1}
             )
             manifest = json.loads((result / "manifest.json").read_text())
-            self.assertEqual(manifest["media"]["downloaded"], 1)
-            self.assertEqual(client.downloads[0]["name"], "thumb.jpg")
+            self.assertEqual(manifest["media"]["downloaded"], 0)
+            self.assertEqual(manifest["media"]["metadata_only"], 1)
+            self.assertEqual(client.downloads, [])
             self.assertTrue(snapshot_verify.verify_snapshot(result, require_full=True)["ok"])
 
 

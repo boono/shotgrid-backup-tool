@@ -75,9 +75,10 @@ button:disabled { opacity: .38; cursor: not-allowed; }
 .progress-track { height: 6px; margin: 20px 18px 0; border-radius: 999px; overflow: hidden; background: #1b1e23; }
 .progress-track div { width: 0; height: 100%; background: linear-gradient(90deg, var(--accent), #9b91ff); transition: width .35s ease; }
 .metric-grid { display: grid; grid-template-columns: repeat(6, 1fr); gap: 1px; margin: 18px; border: 1px solid var(--subtle); background: var(--subtle); }
-.metric-grid article { display: grid; gap: 8px; padding: 13px; background: var(--raised); }
+.metric-grid article { min-width: 0; display: grid; gap: 8px; padding: 13px; background: var(--raised); }
 .metric-grid small { color: var(--muted); font-size: 9px; }
-.metric-grid strong { font: 15px ui-monospace, SFMono-Regular, monospace; }
+.metric-grid strong { overflow-wrap: anywhere; font: 15px ui-monospace, SFMono-Regular, monospace; }
+.metric-grid strong.compact { font-size: 11px; line-height: 1.35; }
 .result-row { display: flex; justify-content: space-between; align-items: center; min-height: 55px; padding: 0 18px; border-top: 1px solid var(--subtle); color: var(--muted); font-size: 11px; }
 .ghost { min-height: 30px; padding: 5px 10px; background: transparent; font-size: 10px; }
 .log-panel pre { min-height: 180px; max-height: 340px; overflow: auto; margin: 0; padding: 15px 18px; color: #aeb4bf; background: #08090b; font: 10px/1.7 ui-monospace, SFMono-Regular, monospace; white-space: pre-wrap; }
