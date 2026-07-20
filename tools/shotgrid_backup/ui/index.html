@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>ShotGrid Backup</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand"><span>SG</span><div><strong>ShotGrid Backup</strong><small>NEWG LOCAL TOOL</small></div></div>
+      <nav>
+        <a class="active" href="#setup">连接与检查</a>
+        <a href="#progress">运行状态</a>
+        <a href="#logs">任务日志</a>
+      </nav>
+      <div class="privacy"><i></i><span>仅监听 127.0.0.1<br>本工具不主动持久化 API Key</span></div>
+    </aside>
+    <main>
+      <header class="topbar">
+        <div><small>LOCAL WORKSPACE / BACKUP</small><h1>ShotGrid 数据备份</h1></div>
+        <div id="connectionBadge" class="badge idle">尚未检查</div>
+      </header>
+
+      <section id="setup" class="panel setup-panel">
+        <div class="panel-head"><div><small>01 / PREFLIGHT</small><h2>连接与运行检查</h2></div><p>检查全部通过后才能开始备份。</p></div>
+        <div class="form-grid">
+          <label class="wide">ShotGrid 地址<input id="siteUrl" placeholder="https://your-site.shotgrid.autodesk.com" autocomplete="off" spellcheck="false" autocapitalize="none"></label>
+          <label>Script Name<input id="scriptName" placeholder="backup" autocomplete="off" spellcheck="false" autocapitalize="none"></label>
+          <label>API Key<input id="scriptKey" type="password" autocomplete="off" spellcheck="false" autocapitalize="none" placeholder="检查后立即从输入框清除"></label>
+          <label>HTTP 代理<input id="httpProxy" placeholder="127.0.0.1:7892（可留空）" autocomplete="off"></label>
+          <label>输出目录<input id="output" value=".local/backups"></label>
+        </div>
+        <div class="scope-block">
+          <strong>固定为完整备份</strong>
+          <p>自动备份当前 Script 可读的全部实体、归档项目、active/retired 记录、Attachment 原文件和 API 可下载媒体。并发数由本机自动确定。</p>
+        </div>
+        <div class="actions">
+          <button id="checkButton" class="secondary">运行完整检查</button>
+          <button id="startButton" class="primary" disabled>开始备份</button>
+        </div>
+        <div id="checkResults" class="check-results empty">等待检查</div>
+      </section>
+
+      <section id="progress" class="panel progress-panel">
+        <div class="panel-head"><div><small>02 / BACKUP JOB</small><h2>运行状态</h2></div><div id="phaseLabel" class="phase">空闲</div></div>
+        <div class="progress-track"><div id="progressBar"></div></div>
+        <div class="metric-grid">
+          <article><small>总体进度</small><strong id="progressValue">0%</strong></article>
+          <article><small>实体</small><strong id="entityValue">0 / 0</strong></article>
+          <article><small>记录</small><strong id="recordValue">0 / 0</strong></article>
+          <article><small>本地文件</small><strong id="attachmentValue">0 / 0</strong></article>
+          <article><small>已用时间</small><strong id="elapsedValue">00:00</strong></article>
+          <article><small>预计剩余</small><strong id="etaValue">--:--</strong></article>
+        </div>
+        <div class="result-row"><span id="resultMessage">尚未开始备份</span><button id="openOutput" class="ghost" disabled>在 Finder 中打开</button></div>
+      </section>
+
+      <section id="logs" class="panel log-panel">
+        <div class="panel-head"><div><small>03 / EVENT STREAM</small><h2>任务日志</h2></div><span id="errorCount">0 errors</span></div>
+        <pre id="logOutput">等待任务事件…</pre>
+      </section>
+    </main>
+  </div>
+  <script src="/app.js"></script>
+</body>
+</html>
