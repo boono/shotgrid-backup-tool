@@ -12,7 +12,7 @@ import sys
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Iterable, Optional
 
-from backup import atomic_json, sha256_file
+from backup import atomic_json, is_ignorable_platform_metadata, sha256_file
 
 
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -110,7 +110,8 @@ def _scan_owned_tree(root: Path, label: str) -> tuple[list[str], set[str]]:
                     elif stat.S_ISDIR(mode):
                         pending.append(path)
                     elif stat.S_ISREG(mode):
-                        regular_files.add(relative)
+                        if not is_ignorable_platform_metadata(relative):
+                            regular_files.add(relative)
                     else:
                         errors.append(f"{label} 不得包含非普通 payload：{relative}")
         except OSError as error:
@@ -426,6 +427,7 @@ def _verify_supplement_contract(
 
     checksum_path = supplement / "checksums.sha256"
     declared_paths: set[str] = set()
+    checksum_row_paths: set[str] = set()
     if not checksum_path.is_file():
         errors.append("媒体补充包缺少 checksums.sha256")
     else:
@@ -434,8 +436,12 @@ def _verify_supplement_contract(
                 relative, target = _safe_owned_path(
                     supplement, raw_relative, "媒体补充包 checksums.sha256"
                 )
-                if relative in declared_paths:
+                if relative in checksum_row_paths:
                     raise ValueError(f"checksums.sha256 重复登记：{relative}")
+                checksum_row_paths.add(relative)
+                if is_ignorable_platform_metadata(relative):
+                    warnings.append(f"忽略平台元数据：{relative}")
+                    continue
                 declared_paths.add(relative)
                 if not target.is_file():
                     errors.append(f"媒体补充包缺少校验文件：{relative}")
@@ -450,7 +456,11 @@ def _verify_supplement_contract(
             relative = path.relative_to(supplement).as_posix()
             if path.is_symlink():
                 errors.append(f"媒体补充包不得包含 symlink：{relative}")
-            elif path.is_file() and relative not in SUPPLEMENT_CONTROL_FILES:
+            elif (
+                path.is_file()
+                and relative not in SUPPLEMENT_CONTROL_FILES
+                and not is_ignorable_platform_metadata(relative)
+            ):
                 actual_payloads.add(relative)
     elif supplement.is_symlink():
         errors.append("媒体补充包根目录不得是 symlink")
@@ -467,10 +477,10 @@ def _verify_supplement_contract(
         files_hashed = _integer(
             integrity.get("files_hashed"), "integrity.files_hashed", errors
         )
-        if files_hashed is not None and files_hashed != len(declared_paths):
+        if files_hashed is not None and files_hashed != len(checksum_row_paths):
             errors.append(
                 "integrity.files_hashed 数量不匹配："
-                f"manifest={files_hashed} actual={len(declared_paths)}"
+                f"manifest={files_hashed} actual={len(checksum_row_paths)}"
             )
     receipt_path = supplement / "COMPLETED.json"
     if not receipt_path.is_file():
@@ -861,11 +871,19 @@ def verify_snapshot(
         errors.append(f"checksums.sha256 路径不安全：{error}")
         checksum_path = None
     declared_paths: set[str] = set()
+    checksum_row_paths: set[str] = set()
     if checksum_path is None or not checksum_path.is_file():
         errors.append("缺少 checksums.sha256")
     else:
         try:
             for expected, relative in parse_checksums(checksum_path):
+                if relative in checksum_row_paths:
+                    errors.append(f"checksums.sha256 重复登记：{relative}")
+                    continue
+                checksum_row_paths.add(relative)
+                if is_ignorable_platform_metadata(relative):
+                    warnings.append(f"忽略平台元数据：{relative}")
+                    continue
                 declared_paths.add(relative)
                 target = safe_snapshot_path(snapshot, relative)
                 if not target.is_file():

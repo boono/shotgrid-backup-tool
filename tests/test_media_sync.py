@@ -486,6 +486,9 @@ class MediaSyncTests(unittest.TestCase):
             self.assertFalse(manifest["policy"]["copy_external"])
             self.assertEqual(manifest["payload_coverage"]["external"], "not_requested")
             self.assertTrue(media_sync.verify_media_supplement(supplement)["ok"])
+            (supplement / ".DS_Store").write_bytes(b"finder-metadata")
+            self.assertTrue(media_sync.verify_media_supplement(supplement)["ok"])
+            self.assertTrue(snapshot_verify.verify_snapshot(supplement)["ok"])
 
     def test_base_attachment_and_media_are_reused_without_client_factory(self):
         with tempfile.TemporaryDirectory() as temp:

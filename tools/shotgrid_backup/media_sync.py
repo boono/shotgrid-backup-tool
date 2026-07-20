@@ -34,11 +34,13 @@ from urllib.parse import unquote, urljoin, urlsplit
 
 try:  # Package import (tests/application) and direct script-directory import.
     from .backup import (
+        TOOL_VERSION,
         atomic_json,
         atomic_text,
         ensure_private_directory,
         fsync_directory,
         json_value,
+        is_ignorable_platform_metadata,
         reject_unexpected_html,
         acquire_output_lock,
         release_output_lock,
@@ -47,11 +49,13 @@ try:  # Package import (tests/application) and direct script-directory import.
     )
 except ImportError:  # pragma: no cover - direct execution compatibility
     from backup import (  # type: ignore
+        TOOL_VERSION,
         atomic_json,
         atomic_text,
         ensure_private_directory,
         fsync_directory,
         json_value,
+        is_ignorable_platform_metadata,
         reject_unexpected_html,
         acquire_output_lock,
         release_output_lock,
@@ -766,7 +770,7 @@ def _seal_recovered_base(
                 "site": source_origin,
                 "site_fingerprint": canonical_fingerprint,
             },
-            "tool": {"name": "ews_sg_media_sync_recovery", "version": "1.0.0"},
+            "tool": {"name": "ews_sg_media_sync_recovery", "version": TOOL_VERSION},
             "mode": mode,
             "updated_since": evidence.get("updated_since"),
             "snapshot_upper_bound": evidence.get("snapshot_upper_bound"),
@@ -820,7 +824,9 @@ def _seal_recovered_base(
         payloads = sorted(
             path
             for path in incomplete.rglob("*")
-            if path.is_file() and path.name not in {"manifest.json", "checksums.sha256", "COMPLETED.json"}
+            if path.is_file()
+            and path.name not in {"manifest.json", "checksums.sha256", "COMPLETED.json"}
+            and not is_ignorable_platform_metadata(path)
         )
         lines = [
             f"{sha256_file(path)}  {path.relative_to(incomplete).as_posix()}" for path in payloads
@@ -3330,7 +3336,9 @@ def materialize_latest_media(
         payloads = sorted(
             path
             for path in incomplete.rglob("*")
-            if path.is_file() and path.name not in {"manifest.json", "checksums.sha256", "COMPLETED.json"}
+            if path.is_file()
+            and path.name not in {"manifest.json", "checksums.sha256", "COMPLETED.json"}
+            and not is_ignorable_platform_metadata(path)
         )
         checksum_lines = [
             f"{sha256_file(path)}  {path.relative_to(incomplete).as_posix()}" for path in payloads
@@ -3467,13 +3475,18 @@ def verify_media_supplement(path: Path) -> Dict[str, Any]:
 
     checksum_path = supplement / "checksums.sha256"
     declared_paths: set = set()
+    checksum_row_paths: set = set()
     if not checksum_path.is_file():
         errors.append("缺少 checksums.sha256")
     else:
         try:
             for expected, relative in _parse_checksums(checksum_path):
-                if relative in declared_paths:
+                if relative in checksum_row_paths:
                     errors.append(f"checksums 重复路径：{relative}")
+                    continue
+                checksum_row_paths.add(relative)
+                if is_ignorable_platform_metadata(relative):
+                    warnings.append(f"忽略平台元数据：{relative}")
                     continue
                 declared_paths.add(relative)
                 target = _safe_relative(supplement, relative)
@@ -3517,7 +3530,10 @@ def verify_media_supplement(path: Path) -> Dict[str, Any]:
                     )
                 elif candidate.is_file():
                     candidate_relative = candidate.relative_to(supplement).as_posix()
-                    if candidate_relative not in root_control_files:
+                    if (
+                        candidate_relative not in root_control_files
+                        and not is_ignorable_platform_metadata(candidate_relative)
+                    ):
                         actual_payloads.add(candidate_relative)
             except OSError:
                 errors.append("supplement 文件树无法安全读取")
@@ -3715,7 +3731,7 @@ def verify_media_supplement(path: Path) -> Dict[str, Any]:
     if int(coverage.get("total_bytes", -1)) != indexed_bytes:
         errors.append("coverage.total_bytes 与 index 不一致")
     integrity = manifest.get("integrity") or {}
-    if int(integrity.get("files_hashed", -1)) != len(declared_paths):
+    if int(integrity.get("files_hashed", -1)) != len(checksum_row_paths):
         errors.append("integrity.files_hashed 与 checksums 行数不一致")
     if calculated_required != calculated_covered or calculated_failed:
         errors.append("required media coverage 未闭合")

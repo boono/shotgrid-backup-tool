@@ -149,6 +149,7 @@ python3 -m venv .venv
 - base `<snapshot_id>.incomplete`：实体或 base 文件失败，不能补媒体，也不能更新 `latest.txt`。
 - supplement `<supplement_id>.incomplete`：至少一个 required media 无法访问、下载、复制或校验；看 supplement manifest、错误日志和事件尾部。
 - `current_refetch`：取得的是补全时刻的当前 image 候选，不是历史时点 exact 证明。
+- `SHA-256 不匹配: .DS_Store`：这是 1.0.0 把 Finder 元数据误纳入旧校验清单造成的兼容问题。升级到 1.0.1 后直接重新运行即可，现有实体 base 不必重做；工具只忽略 `.DS_Store`，不会放宽其他 payload 的 SHA-256 校验。
 - 校验 SHA 不匹配：副本损坏或被修改，从另一份备份重新复制，不要覆盖唯一原件。
 - PublishedFile 路径缺失：先在当前机器正确挂载对应盘或 NAS 并确认读取权限，再创建新的 supplement；工具不会替你 mount 或保存凭据。
 

@@ -163,6 +163,64 @@ class BackupTests(unittest.TestCase):
             self.assertIn("recovery_header.json", (result / "checksums.sha256").read_text())
             self.assertEqual((output / "latest.txt").read_text().strip(), result.name)
 
+    def test_finder_metadata_never_invalidates_a_sealed_snapshot(self):
+        with tempfile.TemporaryDirectory() as temp:
+            output = Path(temp) / "backups"
+            args = Namespace(
+                entities="Shot",
+                output=output,
+                updated_since=None,
+                no_attachments=True,
+                workers=1,
+            )
+
+            def add_finder_metadata(event):
+                if event.get("event") != "snapshot_sealed":
+                    return
+                incomplete = next(output.glob("*.incomplete"))
+                (incomplete / ".DS_Store").write_bytes(b"finder-during-seal")
+
+            result = backup.run_backup(
+                FakeShotGrid(),
+                args,
+                {"page_size": 10, "max_retries": 1},
+                progress=add_finder_metadata,
+            )
+            finder_file = result / ".DS_Store"
+            self.assertTrue(finder_file.is_file())
+            self.assertNotIn(
+                ".DS_Store", (result / "checksums.sha256").read_text(encoding="utf-8")
+            )
+            finder_file.write_bytes(b"finder-after-seal")
+            self.assertTrue(snapshot_verify.verify_snapshot(result)["ok"])
+
+            # Compatibility with snapshots sealed by an older build that put
+            # .DS_Store in the signed checksum list before Finder changed it.
+            finder_file.write_bytes(b"legacy-finder-before-change")
+            checksum_path = result / "checksums.sha256"
+            checksum_text = checksum_path.read_text(encoding="utf-8")
+            backup.atomic_text(
+                checksum_path,
+                checksum_text
+                + f"{backup.sha256_file(finder_file)}  .DS_Store\n",
+            )
+            manifest_path = result / "manifest.json"
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["integrity"]["files_hashed"] += 1
+            backup.atomic_json(manifest_path, manifest)
+            receipt_path = result / "COMPLETED.json"
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            receipt["manifest_sha256"] = backup.sha256_file(manifest_path)
+            receipt["checksums_sha256"] = backup.sha256_file(checksum_path)
+            backup.atomic_json(receipt_path, receipt)
+
+            finder_file.write_bytes(b"legacy-finder-after-change")
+            verification = snapshot_verify.verify_snapshot(result)
+            self.assertTrue(verification["ok"], verification["errors"])
+            self.assertTrue(
+                any(".DS_Store" in warning for warning in verification["warnings"])
+            )
+
     def test_backup_uses_keyset_and_valid_time_operator(self):
         with tempfile.TemporaryDirectory() as temp:
             client = FakeShotGrid()

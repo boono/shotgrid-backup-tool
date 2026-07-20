@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-TOOL_VERSION = "1.0.0"
+TOOL_VERSION = "1.0.1"
 DEFAULT_ENTITIES = [
     "Project", "Asset", "Episode", "Sequence", "Shot", "Task",
     "Version", "Note", "Playlist", "Attachment",
@@ -49,6 +49,12 @@ WINDOWS_ABSOLUTE_PATH = re.compile(
 POSIX_ABSOLUTE_PATH = re.compile(
     r"(?<![A-Za-z0-9_:])/(?:[^,;，；\r\n<>\"']+)"
 )
+
+
+def is_ignorable_platform_metadata(relative: Any) -> bool:
+    """Return whether a path is Finder metadata, never ShotGrid backup data."""
+    name = str(relative).replace("\\", "/").rsplit("/", 1)[-1]
+    return name == ".DS_Store"
 
 
 def json_value(value: Any) -> Any:
@@ -1062,7 +1068,9 @@ def _run_backup_unlocked(
     emit("snapshot_sealed", snapshot_id=snapshot_id, errors=0)
     checksum_paths = [
         path for path in incomplete.rglob("*")
-        if path.is_file() and path.name not in {"checksums.sha256", "manifest.json"}
+        if path.is_file()
+        and path.name not in {"checksums.sha256", "manifest.json"}
+        and not is_ignorable_platform_metadata(path)
     ]
     checksum_lines = [
         f"{sha256_file(path)}  {path.relative_to(incomplete).as_posix()}"
