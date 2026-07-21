@@ -54,7 +54,9 @@ run_backup_app.command
 
 媒体阶段把网络 download 与本地/NAS copy 分成独立资源池。两者都从低并发开始，根据实际吞吐、失败率和重试情况动态升降，不要求操作者猜 worker 数。UI 会持续显示已处理数量、字节进度与 ETA，并分别显示 ShotGrid 下载的当前带宽/并发和本地/NAS 复制的当前带宽/并发，不合并成一个速率；界面不提供带宽或并发选项。download 与 copy 的 ETA 分别使用各自最近 100 个已完成任务耗时的滑动平均，再按各自当前并发计算；样本少于 10 个时显示“校准中”，不使用全程累计平均。
 
-动态调节只改变调度速度，不放宽 required media、hash 或完成门禁。网络失败会进行有上限的自动重试；程序重开后会重新校验断点，hash 正确的已完成文件直接跳过，只补失败、损坏或缺失项。网络受限、NAS 断连或文件缺失时，结果仍是 `.incomplete`，不会以降级完成代替失败。
+动态调节只改变调度速度，不放宽 required media、hash 或完成门禁。网络失败会进行有上限的自动重试；程序重开后会重新校验断点，hash 正确的已完成文件直接跳过，只补失败、损坏或缺失项。1.0.2 起媒体任务会固定启动时的输出目录设备与 inode 身份；若 NAS/外置盘断挂、目录消失或被另一个挂载替换，download 与 copy 队列会立即整体停止，不再把后续几万项逐个记成传输失败，也不会在原挂载点下创建同名本地目录。重新挂载原存储并再次运行即可继续同一个 `.incomplete`。
+
+失败项会在 `media/index.json` 与 `logs/errors.json` 中保存经过脱敏、限长的 `code`、异常类型和说明，便于区分网络超时、ShotGrid locator、transient media 与输出存储断开；URL 签名、API Key 和本机绝对路径不会写入错误详情。网络受限、存储断连或文件缺失时，结果仍是 `.incomplete`，不会以降级完成代替失败。retired Attachment 会先使用 ShotGrid 返回的安全 HTTPS upload locator；旧 locator 失效时仍按 retired 记录重新查询后重试。
 
 macOS Finder 可能在备份目录内自动创建或更新 `.DS_Store`。它不属于 ShotGrid 数据：1.0.1 起不会写入新快照的校验清单，校验旧快照时也会忽略旧清单中的 `.DS_Store`，因此无需为了这类平台元数据重新导出实体；其他文件仍按原有 SHA-256 严格校验。
 

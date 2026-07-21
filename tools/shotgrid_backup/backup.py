@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 
 
-TOOL_VERSION = "1.0.1"
+TOOL_VERSION = "1.0.2"
 DEFAULT_ENTITIES = [
     "Project", "Asset", "Episode", "Sequence", "Shot", "Task",
     "Version", "Note", "Playlist", "Attachment",

@@ -22,7 +22,7 @@
 
 失败或中断的运行保留为 `<supplement_id>.incomplete`。不要删除后缀或把它手工改成正式包；排障后重启会优先校验并续用这份 `.incomplete`，已经完成且 hash 正确的文件直接跳过，只处理失败、损坏和缺失项。若旧暂存包的 lineage 或策略不再匹配，才创建新的 supplement ID。已经完成的 supplement 不会原位更新。
 
-单个下载失败时会先执行有上限的自动重试；过期的 ShotGrid locator 会按实体 ID 和字段重新查询。仍然失败的项目会以脱敏错误码写入 supplement 的 manifest、`logs/errors.json`、`logs/events.jsonl` 和断点索引。只要一个 required ShotGrid 托管媒体最终失败，本轮就不生成 `COMPLETED.json`，UI 明确显示失败数量。重新启动后不会从零开始：程序逐项验证现有文件的 SHA-256，正确项跳过，失败、损坏和缺失项重新处理。没有可信旧 index/hash 的文件不计为已完成。
+单个下载失败时会先执行有上限的自动重试；过期的 ShotGrid locator 会按实体 ID 和字段重新查询，retired Attachment 通过 retired-only 查询取得新的安全 HTTPS upload locator。仍然失败的项目会把经过脱敏、限长的错误码、异常类型与说明写入 supplement 的 manifest、`media/index.json`、`logs/errors.json`、`logs/events.jsonl` 和断点索引；不会保存 URL 签名、API Key 或本机绝对路径。只要一个 required ShotGrid 托管媒体最终失败，本轮就不生成 `COMPLETED.json`，UI 明确显示失败数量。重新启动后不会从零开始：程序逐项验证现有文件的 SHA-256，正确项跳过，失败、损坏和缺失项重新处理。没有可信旧 index/hash 的文件不计为已完成。
 
 如果 `latest.txt` 不存在、指向不存在的目录，或指向的 base 没有通过完成门禁，应用不会把它当作可复用实体快照。没有可复用 base 时，新的完整备份会先生成并发布 base，然后自动开始媒体补全。
 
@@ -148,6 +148,7 @@ python3 -m venv .venv
 - “已有备份正在运行”：同一应用或输出目录有任务；等待结束。若电脑异常关机留下锁文件，先确认没有相关备份进程，再按页面提示处理，避免同时写入同一目标。
 - base `<snapshot_id>.incomplete`：实体或 base 文件失败，不能补媒体，也不能更新 `latest.txt`。
 - supplement `<supplement_id>.incomplete`：至少一个 required media 无法访问、下载、复制或校验；看 supplement manifest、错误日志和事件尾部。
+- `OUTPUT_STORAGE_UNAVAILABLE` / “输出存储已断开”：NAS 或外置盘在任务期间消失、换挂载或返回底层 I/O 断连。1.0.2 起任务会立即停止所有媒体队列，防止在 `/Volumes` 下误建同名本地目录。先在 Finder 确认原卷已重新挂载到相同路径，再重新运行；不要删除 `.incomplete`，已完成且 SHA-256 正确的文件会跳过。
 - `current_refetch`：取得的是补全时刻的当前 image 候选，不是历史时点 exact 证明。
 - `SHA-256 不匹配: .DS_Store`：这是 1.0.0 把 Finder 元数据误纳入旧校验清单造成的兼容问题。升级到 1.0.1 后直接重新运行即可，现有实体 base 不必重做；工具只忽略 `.DS_Store`，不会放宽其他 payload 的 SHA-256 校验。
 - 校验 SHA 不匹配：副本损坏或被修改，从另一份备份重新复制，不要覆盖唯一原件。

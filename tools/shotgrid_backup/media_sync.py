@@ -9,6 +9,7 @@ interrupted directory itself is never modified.
 from __future__ import annotations
 
 import datetime as dt
+import errno
 import hashlib
 import http.client
 import ipaddress
@@ -118,6 +119,60 @@ class MediaSyncError(RuntimeError):
 
 class TransientMediaPending(MediaSyncError):
     """ShotGrid is still returning its transient processing placeholder."""
+
+
+class OutputStorageUnavailable(MediaSyncError):
+    """The output filesystem disappeared or changed while a job was running."""
+
+
+_OUTPUT_STORAGE_ERRNOS = {
+    value
+    for name in ("EIO", "ENODEV", "ENOTCONN", "ENXIO", "ESTALE")
+    if (value := getattr(errno, name, None)) is not None
+}
+
+
+def _is_output_storage_error(error: BaseException) -> bool:
+    current: Optional[BaseException] = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        if isinstance(current, OSError) and current.errno in _OUTPUT_STORAGE_ERRNOS:
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
+class _OutputStorageGuard:
+    """Pin a media job to the output directory that existed at job start."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        try:
+            current = root.lstat()
+        except OSError as error:
+            raise OutputStorageUnavailable(
+                "输出目录当前不可用；请确认本地磁盘或 NAS 已挂载后再继续"
+            ) from error
+        if root.is_symlink() or not stat.S_ISDIR(current.st_mode):
+            raise OutputStorageUnavailable("媒体补全要求输出目录已存在且不是符号链接")
+        self.identity = (current.st_dev, current.st_ino)
+
+    def check(self) -> None:
+        try:
+            current = self.root.lstat()
+        except OSError as error:
+            raise OutputStorageUnavailable(
+                "输出存储已断开；任务已立即停止，重新挂载后可断点续传"
+            ) from error
+        if self.root.is_symlink() or not stat.S_ISDIR(current.st_mode):
+            raise OutputStorageUnavailable(
+                "输出存储路径已消失或类型发生变化；任务已立即停止"
+            )
+        if (current.st_dev, current.st_ino) != self.identity:
+            raise OutputStorageUnavailable(
+                "输出存储挂载身份发生变化；为防止写入错误磁盘，任务已立即停止"
+            )
 
 
 def _require_disk_capacity(directory: Path, requested_bytes: int = 0) -> None:
@@ -1481,7 +1536,15 @@ def _public_item(item: Dict[str, Any]) -> Dict[str, Any]:
         "temporal_fidelity",
         "source_fingerprint",
     }
-    return {key: json_value(value) for key, value in item.items() if key in allowed}
+    result = {key: json_value(value) for key, value in item.items() if key in allowed}
+    if item.get("status") == "failed":
+        message = item.get("_error") or item.get("_planning_error")
+        result["error"] = {
+            "code": str(item.get("_error_code") or "TRANSFER_FAILED"),
+            "type": str(item.get("_error_type") or "MediaSyncError"),
+            "message": str(message or "未提供错误详情")[:600],
+        }
+    return result
 
 
 def _new_counters() -> Dict[str, int]:
@@ -1686,7 +1749,24 @@ def _sg_download_once(client: Any, item: Dict[str, Any], target: Path) -> int:
     os.close(descriptor)
     try:
         if source["type"] == "Attachment" and item["field"] == "this_file":
-            client.download_attachment(int(source["id"]), str(part))
+            # The legacy ID endpoint cannot reliably resolve retired Attachments.
+            # shotgun_api3 officially accepts the upload locator dict; use it
+            # only for retired records and keep the active-record path unchanged.
+            locator = item.get("_locator")
+            if item.get("state") == "retired" and isinstance(locator, dict):
+                url = _locator_url(locator)
+                parsed = urlsplit(url or "")
+                if (
+                    parsed.scheme.lower() != "https"
+                    or not parsed.hostname
+                    or parsed.username is not None
+                    or parsed.password is not None
+                    or parsed.fragment
+                ):
+                    raise MediaSyncError("retired Attachment locator 不是安全 HTTPS URL")
+                client.download_attachment(locator, file_path=str(part))
+            else:
+                client.download_attachment(int(source["id"]), str(part))
         else:
             client.download_attachment(item["_locator"], file_path=str(part))
         if part.is_symlink() or not part.is_file() or part.stat().st_size <= 0:
@@ -2365,6 +2445,8 @@ def _bounded_item_error(item: Dict[str, Any], error: BaseException) -> Dict[str,
 
 
 def _error_code(error: BaseException) -> str:
+    if isinstance(error, OutputStorageUnavailable) or _is_output_storage_error(error):
+        return "OUTPUT_STORAGE_UNAVAILABLE"
     if isinstance(error, TransientMediaPending):
         return "TRANSIENT_MEDIA_PENDING"
     code = getattr(error, "code", None) or getattr(error, "errcode", None)
@@ -2374,14 +2456,36 @@ def _error_code(error: BaseException) -> str:
     message = str(error).lower()
     if "timeout" in name or "timed out" in message:
         return "TIMEOUT"
+    if isinstance(error, ssl.SSLError) or "ssl" in name or "tls" in message:
+        return "TLS_FAILED"
+    if isinstance(error, socket.gaierror) or "dns" in message:
+        return "DNS_FAILED"
+    if isinstance(error, ConnectionError) or any(
+        marker in message
+        for marker in ("connection reset", "connection aborted", "remote end closed")
+    ):
+        return "CONNECTION_FAILED"
     if "size" in message or "大小" in message:
         return "SIZE_MISMATCH"
     if "html" in message.lower():
         return "UNEXPECTED_HTML"
     if "symlink" in message.lower() or "符号链接" in message:
         return "UNSAFE_SYMLINK"
-    if "https" in message.lower() or "locator" in message.lower():
+    if "download" in name and "shotgun" in name:
+        return "SHOTGRID_DOWNLOAD_FAILED"
+    if any(
+        marker in message
+        for marker in (
+            "unsafe",
+            "userinfo",
+            "非公网",
+            "不是安全 https",
+            "拒绝",
+        )
+    ):
         return "UNSAFE_LOCATOR"
+    if "locator" in message or "https url" in message:
+        return "INVALID_LOCATOR"
     return "TRANSFER_FAILED"
 
 
@@ -2390,11 +2494,13 @@ def _manifest_errors(plan: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     for item in plan:
         if item.get("status") != "failed" or not item.get("_required"):
             continue
+        public_error = _public_item(item).get("error") or {}
         errors.append(
             {
                 "source": item["source"],
                 "field": item["field"],
                 "error_code": str(item.get("_error_code") or "TRANSFER_FAILED"),
+                "error": public_error,
             }
         )
     return errors
@@ -2634,6 +2740,8 @@ def _run_dynamic_queue(
     persist: Callable[[], None],
     checkpoint: Callable[[Dict[str, Any]], None],
     state_lock: threading.RLock,
+    storage_check: Callable[[], None],
+    abort_event: threading.Event,
 ) -> None:
     queue_stats = queues[kind]
     if not tasks:
@@ -2667,6 +2775,15 @@ def _run_dynamic_queue(
         )
 
     while cursor < len(tasks):
+        if abort_event.is_set():
+            raise OutputStorageUnavailable(
+                "输出存储已断开；并行队列已停止，重新挂载后可断点续传"
+            )
+        try:
+            storage_check()
+        except OutputStorageUnavailable:
+            abort_event.set()
+            raise
         window = tasks[cursor : cursor + max(workers * 2, 1)]
         cursor += len(window)
         started = time.monotonic()
@@ -2676,6 +2793,12 @@ def _run_dynamic_queue(
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {executor.submit(timed_call, call): item for item, call in window}
             for future in as_completed(futures):
+                if abort_event.is_set():
+                    for pending in futures:
+                        pending.cancel()
+                    raise OutputStorageUnavailable(
+                        "输出存储已断开；并行队列已停止，重新挂载后可断点续传"
+                    )
                 item = futures[future]
                 succeeded, value, task_duration = future.result()
                 processed += 1
@@ -2746,6 +2869,22 @@ def _run_dynamic_queue(
                         }
                 else:
                     error = value
+                    try:
+                        storage_check()
+                    except OutputStorageUnavailable:
+                        abort_event.set()
+                        for pending in futures:
+                            pending.cancel()
+                        raise
+                    if isinstance(error, OutputStorageUnavailable) or _is_output_storage_error(
+                        error
+                    ):
+                        abort_event.set()
+                        for pending in futures:
+                            pending.cancel()
+                        raise OutputStorageUnavailable(
+                            "输出存储连接中断；任务已立即停止，重新挂载后可断点续传"
+                        ) from error
                     bounded = _bounded_item_error(item, error)
                     window_errors += 1
                     with state_lock:
@@ -2981,16 +3120,23 @@ def materialize_latest_media(
     Hosted media is always required.  External local/NAS/PublishedFile payloads
     are required only when ``copy_external`` is true.
     """
-    root = Path(output_root).expanduser().resolve()
+    requested_root = Path(output_root).expanduser()
     if int(max_workers) < 1 or int(max_workers) > 32:
         raise ValueError("max_workers 必须在 1..32")
-    ensure_private_directory(root)
+    try:
+        root = requested_root.resolve(strict=True)
+    except OSError as error:
+        raise OutputStorageUnavailable(
+            "媒体补全所需的输出目录不存在；请先确认本地磁盘或 NAS 已挂载"
+        ) from error
+    storage_guard = _OutputStorageGuard(root)
     lock_path = root / ".backup.lock"
     try:
         lock_fd, lock_identity = acquire_output_lock(lock_path)
     except RuntimeError as error:
         raise MediaSyncError(str(error)) from error
     try:
+        storage_guard.check()
         base, interrupted = _select_or_recover_base(root, sg)
         verification = _verify_base_snapshot(base, require_full=False)
         if not verification.get("ok"):
@@ -3017,6 +3163,7 @@ def materialize_latest_media(
 
         counters = _new_counters()
         plan = _build_media_plan(base, bool(copy_external))
+        storage_guard.check()
         _apply_base_reuse(plan, base, counters)
         _prepare_local_items(plan)
         supplements_root = root / "media_supplements" / base.name
@@ -3234,6 +3381,7 @@ def materialize_latest_media(
 
         def persist_running() -> None:
             with state_lock:
+                storage_guard.check()
                 queues["download"].update(retry_counts)
                 manifest = _build_manifest(
                     supplement_id,
@@ -3252,6 +3400,7 @@ def materialize_latest_media(
 
         persist_running()
         download_cap = int(max_workers) if client_factory is not None else 1
+        storage_abort = threading.Event()
         with ThreadPoolExecutor(max_workers=2) as pool_executor:
             pool_futures = [
                 pool_executor.submit(
@@ -3266,6 +3415,8 @@ def materialize_latest_media(
                     persist_running,
                     checkpoint_sink.append,
                     state_lock,
+                    storage_guard.check,
+                    storage_abort,
                 ),
                 pool_executor.submit(
                     _run_dynamic_queue,
@@ -3279,10 +3430,13 @@ def materialize_latest_media(
                     persist_running,
                     checkpoint_sink.append,
                     state_lock,
+                    storage_guard.check,
+                    storage_abort,
                 ),
             ]
             for pool_future in as_completed(pool_futures):
                 pool_future.result()
+        storage_guard.check()
         _deduplicate_supplement_files(incomplete, plan)
         queues["download"].update(retry_counts)
         _assert_hash_triplet(base, base_hashes)
@@ -3370,7 +3524,14 @@ def materialize_latest_media(
             progress({"event": "media_supplement_complete", "path": str(final)})
         return final
     finally:
-        release_output_lock(lock_path, lock_fd, lock_identity)
+        try:
+            release_output_lock(lock_path, lock_fd, lock_identity)
+        except OSError as error:
+            if _is_output_storage_error(error):
+                raise OutputStorageUnavailable(
+                    "输出存储在释放任务锁时断开；重新挂载后可断点续传"
+                ) from error
+            raise
 
 
 def _verify_supplement_file_shape(

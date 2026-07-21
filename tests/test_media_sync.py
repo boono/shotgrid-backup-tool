@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import hashlib
 import io
 import json
@@ -889,6 +890,13 @@ class MediaSyncTests(unittest.TestCase):
             item = index_by_source(partial)[("PublishedFile", 1, "path")]
             self.assertEqual(item["status"], "failed")
             self.assertEqual(item["files"], [])
+            self.assertEqual(item["error"]["code"], "TRANSIENT_MEDIA_PENDING")
+            self.assertEqual(item["error"]["type"], "TransientMediaPending")
+            persisted_errors = load_json(partial / "logs/errors.json")
+            self.assertEqual(
+                persisted_errors[0]["error"]["message"],
+                item["error"]["message"],
+            )
             self.assertEqual(client.refetch_calls, 1)
             self.assertEqual(client.download_calls, [])
 
@@ -978,6 +986,70 @@ class MediaSyncTests(unittest.TestCase):
         self.assertEqual(result, "retired-value")
         self.assertEqual(len(client.calls), 1)
         self.assertTrue(client.calls[0][3]["retired_only"])
+
+    def test_retired_attachment_download_uses_validated_locator_dict(self):
+        with tempfile.TemporaryDirectory() as temp:
+            payload = b"retired-attachment-payload"
+            locator = upload_value("retired.bin", payload)
+            client = FakeShotGrid({}, {}, {locator["url"]: payload})
+            target = Path(temp) / "retired.bin"
+            size = media_sync._sg_download_once(
+                client,
+                {
+                    "source": {"type": "Attachment", "id": 41},
+                    "field": "this_file",
+                    "state": "retired",
+                    "_locator": locator,
+                    "_expected_size": len(payload),
+                },
+                target,
+            )
+            self.assertEqual(size, len(payload))
+            self.assertEqual(target.read_bytes(), payload)
+            self.assertEqual(client.download_calls, [locator])
+
+    def test_missing_output_and_disconnected_storage_fail_without_mass_failures(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            missing = root / "missing-output"
+            with self.assertRaises(media_sync.OutputStorageUnavailable):
+                media_sync.materialize_latest_media(
+                    missing,
+                    FakeShotGrid({}, {}),
+                    max_workers=1,
+                )
+            self.assertFalse(missing.exists())
+
+            output = root / "backups"
+            values = {
+                source_id: upload_value(f"image_{source_id}.jpg", b"payload")
+                for source_id in range(1, 9)
+            }
+            schemas = {
+                "PublishedFile": {"id": field("number"), "path": field("text")}
+            }
+            records = {
+                "PublishedFile": [
+                    {"type": "PublishedFile", "id": source_id, "path": values[source_id]}
+                    for source_id in values
+                ]
+            }
+            base, client = make_base(output, schemas, records)
+            disconnected = OSError(errno.ENOTCONN, "Socket is not connected")
+            with mock.patch.object(
+                client, "download_attachment", side_effect=disconnected
+            ), self.assertRaises(media_sync.OutputStorageUnavailable):
+                media_sync.materialize_latest_media(
+                    output,
+                    client,
+                    client_factory=client.factory,
+                    max_workers=4,
+                )
+
+            partials = incomplete_supplements(output, base.name)
+            self.assertEqual(len(partials), 1)
+            statuses = [item["status"] for item in supplement_index(partials[0])]
+            self.assertEqual(set(statuses), {"pending"})
 
     def test_verify_rejects_payload_size_hash_lineage_and_duplicate_index(self):
         with tempfile.TemporaryDirectory() as temp:
